@@ -8,7 +8,7 @@ permalink: /about/
 - Reverse engineering
 - Fuzzing
 - Development
-- Smoke
+- Smoking
 <br>
 
 Information must be <span style="margin-left: auto; text-align: right; color: #fe7e61; font-size: 16px; font-style: bold; font-family: Courier"> _>OPEN!</span>
