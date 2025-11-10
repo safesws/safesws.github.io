@@ -1,6 +1,6 @@
 ---
 layout: post
-title:  Windows NAT (WinNat)
+title:  Windows NAT (WINNAT)
 categories: [Windows, Kernel, NAT, Containers]
 ---
 
@@ -72,6 +72,36 @@ Let’s analyze <span class="emphasizer_code_function_2">MSFT_NetNat_CreateInsta
 <br>
 As we can see from the IDA pseudo-code for <span class="emphasizer_code_function_2">MSFT_NetNat_CreateInstance</span> it uses <span class="emphasizer_code_function_2">NSI</span> with a specified _Network Programming Interface module_ (<span class="emphasizer_code_function_2">NPI_MS_WINNAT_MODULEID</span>). A _Network Programming Interface_, or <span class="emphasizer_code_function_2">NPI</span>, defines the interface between network modules that can be attached to one another __[__ [network-programming-interface](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/network-programming-interface) __]__ . 
 <br>
+<br>
+If we are going to analyze <span class="emphasizer_code_function_2">HNS</span> implementation (presented by <span class="emphasizer_code_function_2">HostNetSvc.dll</span>), we can observe the <span class="emphasizer_code_function_2">NAT</span> network creation:
+<p align="center">
+<a href="../images/winnat/image3x1.png" target="_blank">
+<img src="../images/winnat/image3x1.png" alt="" width="500" height="300">
+</a>
+</p>
+<div class="emphasizer_img_text">[ HNS::Service::Resource::NATResource::Allocate method ]</div>
+<br>
+From the preudo-code above we can see that like in <span class="emphasizer_code_function_2">MSFT_NetNat_CreateInstance</span> from the <span class="emphasizer_code_function_2">NetNat.dll</span> it uses <span class="emphasizer_code_function_2">NSI</span> to communicate with <span class="emphasizer_code_function_2">NPI_MS_WINNAT_MODULEID</span> module.<br><br>
+<span class="emphasizer_code_function_2">StartNatService</span> function starts service named <span class="emphasizer_code_function_2">"winnat"</span>:
+<p align="center">
+<a href="../images/winnat/image3x2.png" target="_blank">
+<img src="../images/winnat/image3x2.png" alt="" width="500" height="300">
+</a>
+</p>
+<div class="emphasizer_img_text">[ StartNatService function ]</div>
+<br>
+<br>
+
+## WINNAT.SYS
+We can find what <span class="emphasizer_code_function_2">"winnat"</span> service is for:
+<p align="center">
+<a href="../images/winnat/image3x3.png" target="_blank">
+<img src="../images/winnat/image3x3.png" alt="" width="500" height="300">
+</a>
+</p>
+<div class="emphasizer_img_text">[ winnat.sys ]</div>
+<br>
+Let's analyze <span class="emphasizer_code_function_2">winnat.sys</span> driver:
 <p align="center">
 <a href="../images/winnat/image4.png" target="_blank">
 <img src="../images/winnat/image4.png" alt="" width="500" height="300">
@@ -88,9 +118,8 @@ As we can see from the IDA pseudo-code for <span class="emphasizer_code_function
 <div class="emphasizer_img_text">[ NPI_MS_WINNAT_MODULEID ]</div>
 <br>
 We can decode it as <span class="emphasizer_code_function_2">GUID</span> and get <span class="emphasizer_code_function_2">204A00EB-1A9B-D411-9123-0050047759BC</span>.
-<br><br>
-## WINNAT.SYS
-<span class="emphasizer_code_function_2">Winnat.sys</span> registers itself as a _Provider_ (<span class="emphasizer_code_function_2">NPI_MS_WINNAT_MODULEID = 204A00EB-1A9B-D411-9123-0050047759BC</span>) to _Network Module Registrar_ (<span class="emphasizer_code_function_2">NMR</span>) and <span class="emphasizer_code_function_2">NetNat.dll</span> uses it as _Client_ __[__ [introduction-to-the-network-module-registrar](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/introduction-to-the-network-module-registrar) __]__.
+<br>
+<span class="emphasizer_code_function_2">Winnat.sys</span> registers itself as a _Provider_ (<span class="emphasizer_code_function_2">NPI_MS_WINNAT_MODULEID = 204A00EB-1A9B-D411-9123-0050047759BC</span>) to _Network Module Registrar_ (<span class="emphasizer_code_function_2">NMR</span>) and <span class="emphasizer_code_function_2">NetNat.dll</span> as well as <span class="emphasizer_code_function_2">HostNetSvc.dll</span> use it as _Clients_ __[__ [introduction-to-the-network-module-registrar](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/introduction-to-the-network-module-registrar) __]__.
 <br>
 <p align="center">
 <a href="../images/winnat/image6.png" target="_blank">
@@ -227,5 +256,5 @@ So, overall flow for <span class="emphasizer_code_function_2">winnat.sys</span> 
 <br>
 <br>
 So, traffic from the one <span class="emphasizer_code_function_2">container</span> _isolated_ inside <span class="emphasizer_code_function_2">compartment</span> get routed to the _default host_ <span class="emphasizer_code_function_2">compartment</span> and back using <span class="emphasizer_code_function_2">NAT</span> implemented by <span class="emphasizer_code_function_2">WFP</span> callout driver named <span class="emphasizer_code_function_2">winnat.sys</span>. 
-<br>
+<br><br>
 Also we can conclude that a traffic from the _all_ <span class="emphasizer_code_function_2">compartments</span> is _visible_ for <span class="emphasizer_code_function_2">WFP</span> callaouts drivers.  
