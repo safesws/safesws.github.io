@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Path of a Packet Through the Linux Kernel</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0a0e14; }
+  #root { min-height: 100vh; }
+</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef, useCallback, useEffect } = React;
+
+const isInIframe = (() => { try { return window.self !== window.top; } catch(e) { return true; } })();
+
+const COLORS = {
+  bg: "#0a0e14",
+  surface: "#111820",
+  surfaceLight: "#1a2230",
+  border: "#2a3545",
+  borderActive: "#3d8bfd",
+  text: "#c8d3e0",
+  textDim: "#6b7d93",
+  textBright: "#e8edf3",
+  accent: "#3d8bfd",
+  accentGlow: "rgba(61,139,253,0.15)",
+  green: "#43d9a2",
+  greenDim: "rgba(67,217,162,0.15)",
+  orange: "#f0a050",
+  orangeDim: "rgba(240,160,80,0.15)",
+  red: "#f05868",
+  redDim: "rgba(240,88,104,0.15)",
+  purple: "#b07df0",
+  purpleDim: "rgba(176,125,240,0.15)",
+  yellow: "#e8d44d",
+  yellowDim: "rgba(232,212,77,0.15)",
+  cyan: "#40d0e0",
+  cyanDim: "rgba(64,208,224,0.15)",
+};
+
+const fontMono = "'JetBrains Mono', 'Fira Code', 'SF Mono', Consolas, monospace";
+const fontSans = "'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif";
+
+function FuncBox({ x, y, w, h, label, sublabel, color, dimColor, fontSize = 11 }) {
+  return (
+    <g>
+      <rect x={x} y={y} width={w} height={h} rx={4} fill={dimColor} stroke={color} strokeWidth={1.2} />
+      <text x={x + w / 2} y={y + (sublabel ? h / 2 - 4 : h / 2 + 1)} textAnchor="middle" dominantBaseline="middle" fill={color} fontFamily={fontMono} fontSize={fontSize} fontWeight={600}>
+        {label}
+      </text>
+      {sublabel && (
+        <text x={x + w / 2} y={y + h / 2 + 10} textAnchor="middle" dominantBaseline="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={9}>
+          {sublabel}
+        </text>
+      )}
+    </g>
+  );
+}
+
+function Arrow({ x1, y1, x2, y2, color = COLORS.textDim, dashed = false, label = "" }) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  const ux = dx / len;
+  const uy = dy / len;
+  const ax2 = x2 - ux * 6;
+  const ay2 = y2 - uy * 6;
+  const px = -uy * 4;
+  const py = ux * 4;
+  return (
+    <g>
+      <line x1={x1} y1={y1} x2={ax2} y2={ay2} stroke={color} strokeWidth={1.3} strokeDasharray={dashed ? "4,3" : "none"} />
+      <polygon points={`${x2},${y2} ${ax2 + px},${ay2 + py} ${ax2 - px},${ay2 - py}`} fill={color} />
+      {label && (
+        <text x={(x1 + x2) / 2 + 8} y={(y1 + y2) / 2} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5} dominantBaseline="middle">
+          {label}
+        </text>
+      )}
+    </g>
+  );
+}
+
+function LayerBand({ x, y, w, h, label, color, dimColor }) {
+  return (
+    <g>
+      <rect x={x} y={y} width={w} height={h} rx={6} fill={dimColor} stroke={color} strokeWidth={0.8} strokeDasharray="6,4" opacity={0.5} />
+      <text x={x + 10} y={y + 16} fill={color} fontFamily={fontSans} fontSize={11} fontWeight={700} opacity={0.8} letterSpacing="1.5">
+        {label}
+      </text>
+    </g>
+  );
+}
+
+function HookMarker({ x, y, label, color = COLORS.red }) {
+  return (
+    <g>
+      <circle cx={x} cy={y} r={4} fill={color} opacity={0.8} />
+      <circle cx={x} cy={y} r={7} fill="none" stroke={color} strokeWidth={0.8} opacity={0.4} />
+      <text x={x + 10} y={y + 1} fill={color} fontFamily={fontMono} fontSize={8} dominantBaseline="middle" opacity={0.9}>
+        {label}
+      </text>
+    </g>
+  );
+}
+
+function EgressDiagram() {
+  const W = 920;
+  const H = 1300;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
+      <defs>
+        <filter id="glow">
+          <feGaussianBlur stdDeviation="3" result="blur" />
+          <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+        </filter>
+      </defs>
+
+      <rect width={W} height={H} fill={COLORS.bg} rx={8} />
+
+      <text x={W / 2} y={35} textAnchor="middle" fill={COLORS.textBright} fontFamily={fontSans} fontSize={18} fontWeight={700} letterSpacing="0.5">
+        EGRESS PATH — TX
+      </text>
+      <text x={W / 2} y={52} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={11}>
+        Userspace Application → Wire
+      </text>
+
+      {/* USERSPACE */}
+      <LayerBand x={30} y={70} w={W - 60} h={70} label="USERSPACE" color={COLORS.green} dimColor={COLORS.greenDim} />
+      <FuncBox x={340} y={90} w={240} h={36} label="write() / sendto() / sendmsg()" color={COLORS.green} dimColor={COLORS.bg} fontSize={10} />
+      <Arrow x1={460} y1={126} x2={460} y2={165} color={COLORS.green} label="syscall" />
+      <text x={200} y={114} fill={COLORS.textDim} fontFamily={fontSans} fontSize={9}>Application buffer (userspace)</text>
+
+      {/* SOCKET LAYER */}
+      <LayerBand x={30} y={165} w={W - 60} h={110} label="SOCKET LAYER" color={COLORS.accent} dimColor={COLORS.accentGlow} />
+      <FuncBox x={340} y={188} w={240} h={32} label="sock_sendmsg()" sublabel="" color={COLORS.accent} dimColor={COLORS.bg} />
+      <text x={620} y={200} fill={COLORS.textDim} fontFamily={fontSans} fontSize={9}>Attach creds from task_struct</text>
+      <text x={620} y={213} fill={COLORS.textDim} fontFamily={fontSans} fontSize={9}>(PID, UID, GID)</text>
+
+      <HookMarker x={370} y={232} label="LSM hook (SELinux / AppArmor)" color={COLORS.red} />
+
+      <FuncBox x={340} y={245} w={240} h={26} label="INDIRECT_CALL_INET" color={COLORS.accent} dimColor={COLORS.bg} fontSize={10} />
+      <text x={620} y={260} fill={COLORS.textDim} fontFamily={fontSans} fontSize={9}>Dispatch via sk_prot→sendmsg</text>
+
+      {/* Branch to TCP / UDP */}
+      <Arrow x1={400} y1={271} x2={260} y2={310} color={COLORS.accent} />
+      <Arrow x1={520} y1={271} x2={660} y2={310} color={COLORS.accent} />
+
+      {/* TRANSPORT LAYER */}
+      <LayerBand x={30} y={290} w={W - 60} h={270} label="TRANSPORT LAYER" color={COLORS.orange} dimColor={COLORS.orangeDim} />
+
+      {/* TCP Column */}
+      <rect x={60} y={310} width={370} height={240} rx={5} fill="rgba(240,160,80,0.05)" stroke={COLORS.orange} strokeWidth={0.5} strokeDasharray="3,3" />
+      <text x={245} y={328} textAnchor="middle" fill={COLORS.orange} fontFamily={fontSans} fontSize={12} fontWeight={700}>TCP</text>
+
+      <FuncBox x={110} y={338} w={270} h={26} label="tcp_sendmsg()" color={COLORS.orange} dimColor={COLORS.bg} />
+      <text x={110} y={376} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Wait for ESTABLISHED state</text>
+      <text x={110} y={388} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Alloc sk_buff per MSS, copy from user</text>
+      <text x={110} y={400} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• skb_add_data_nocache() or new pages</text>
+      <text x={110} y={412} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Enqueue to sk→sk_write_queue</text>
+
+      <FuncBox x={110} y={420} w={270} h={26} label="tcp_push() → tcp_write_xmit()" color={COLORS.orange} dimColor={COLORS.bg} fontSize={10} />
+      <text x={110} y={458} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Apply cwnd / rwnd constraints</text>
+      <text x={110} y={470} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Set retransmission timers</text>
+      <text x={110} y={482} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Build TCP hdr (seq/ack/flags/win/opts)</text>
+
+      <FuncBox x={110} y={492} w={270} h={26} label="tcp_transmit_skb()" color={COLORS.orange} dimColor={COLORS.bg} />
+      <text x={110} y={530} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Checksum (or CHECKSUM_PARTIAL for HW)</text>
+      <text x={110} y={542} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• icsk_af_ops→queue_xmit → IP layer</text>
+
+      {/* UDP Column */}
+      <rect x={490} y={310} width={370} height={240} rx={5} fill="rgba(240,160,80,0.05)" stroke={COLORS.orange} strokeWidth={0.5} strokeDasharray="3,3" />
+      <text x={675} y={328} textAnchor="middle" fill={COLORS.orange} fontFamily={fontSans} fontSize={12} fontWeight={700}>UDP</text>
+
+      <FuncBox x={540} y={338} w={270} h={26} label="udp_sendmsg()" color={COLORS.orange} dimColor={COLORS.bg} />
+      <text x={540} y={376} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• ip_route_output_flow() — route lookup</text>
+      <text x={540} y={388} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Build UDP header (src/dst port, len, csum)</text>
+
+      <FuncBox x={540} y={400} w={270} h={26} label="Cork / No-Cork decision" color={COLORS.orange} dimColor={COLORS.bg} fontSize={10} />
+      <text x={540} y={438} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• UDP_CORK: batch multiple sendmsg()</text>
+      <text x={540} y={450} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• No cork: build sk_buff immediately</text>
+
+      <FuncBox x={540} y={460} w={270} h={26} label="ip_make_skb() + udp_send_skb()" color={COLORS.orange} dimColor={COLORS.bg} fontSize={10} />
+      <text x={540} y={498} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• ip_append_data() combines datagrams</text>
+      <text x={540} y={510} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Simpler: no locking, no state machine</text>
+
+      {/* Merge arrows to IP */}
+      <Arrow x1={460} y1={560} x2={460} y2={580} color={COLORS.orange} />
+
+      {/* IP LAYER */}
+      <LayerBand x={30} y={580} w={W - 60} h={280} label="IP LAYER (IPv4)" color={COLORS.purple} dimColor={COLORS.purpleDim} />
+
+      <FuncBox x={300} y={598} w={320} h={28} label="__ip_queue_xmit() / ip_push_pending_frames()" color={COLORS.purple} dimColor={COLORS.bg} fontSize={9.5} />
+      <text x={660} y={610} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Route lookup: FIB trie</text>
+      <text x={660} y={622} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>(skip if cached in skb→_skb_refdst)</text>
+
+      <FuncBox x={340} y={640} w={240} h={26} label="Build IP header" color={COLORS.purple} dimColor={COLORS.bg} fontSize={10} />
+      <text x={620} y={655} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>ver, IHL, TOS, TTL, proto, src/dst addr</text>
+
+      <HookMarker x={190} y={680} label="NF_INET_LOCAL_OUT (iptables OUTPUT chain, conntrack)" color={COLORS.red} />
+
+      <FuncBox x={340} y={698} w={240} h={26} label="ip_output()" color={COLORS.purple} dimColor={COLORS.bg} />
+
+      <HookMarker x={190} y={738} label="NF_INET_POST_ROUTING  (SNAT / masquerade)" color={COLORS.red} />
+
+      <FuncBox x={340} y={755} w={240} h={26} label="ip_finish_output()" color={COLORS.purple} dimColor={COLORS.bg} />
+      <text x={620} y={766} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>MTU check → ip_fragment() if needed</text>
+      <text x={620} y={778} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>(unless DF set — PMTUD)</text>
+
+      <FuncBox x={340} y={798} w={240} h={32} label="neigh_resolve_output()" sublabel="" color={COLORS.purple} dimColor={COLORS.bg} />
+      <text x={620} y={810} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>ARP cache or ARP request</text>
+      <text x={620} y={822} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Queue skb if ARP pending</text>
+
+      <text x={370} y={848} fill={COLORS.purple} fontFamily={fontMono} fontSize={9}>Push Ethernet header onto sk_buff</text>
+
+      <Arrow x1={460} y1={625} x2={460} y2={640} color={COLORS.purple} />
+      <Arrow x1={460} y1={666} x2={460} y2={698} color={COLORS.purple} />
+      <Arrow x1={460} y1={724} x2={460} y2={755} color={COLORS.purple} />
+      <Arrow x1={460} y1={781} x2={460} y2={798} color={COLORS.purple} />
+
+      {/* QDISC / DEVICE LAYER */}
+      <LayerBand x={30} y={870} w={W - 60} h={220} label="QDISC / DEVICE LAYER" color={COLORS.cyan} dimColor={COLORS.cyanDim} />
+
+      <Arrow x1={460} y1={860} x2={460} y2={898} color={COLORS.cyan} />
+
+      <FuncBox x={340} y={898} w={240} h={26} label="dev_queue_xmit()" color={COLORS.cyan} dimColor={COLORS.bg} />
+      <text x={620} y={913} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Set skb→mac_header</text>
+
+      <HookMarker x={190} y={938} label="tc_egress() — TC-BPF / u32 / flower classifiers" color={COLORS.red} />
+
+      <FuncBox x={340} y={955} w={240} h={26} label="qdisc enqueue / __qdisc_run()" color={COLORS.cyan} dimColor={COLORS.bg} fontSize={10} />
+      <text x={620} y={968} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>pfifo_fast / fq_codel / HTB / etc.</text>
+
+      <FuncBox x={340} y={995} w={240} h={28} label="validate_xmit_skb()" color={COLORS.cyan} dimColor={COLORS.bg} />
+      <text x={620} y={1008} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>VLAN tag, GSO/TSO segmentation,</text>
+      <text x={620} y={1020} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>checksum finalization</text>
+
+      <FuncBox x={340} y={1035} w={240} h={26} label="ndo_start_xmit()" color={COLORS.cyan} dimColor={COLORS.bg} />
+      <text x={620} y={1050} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Driver callback → TX ring descriptor</text>
+
+      <Arrow x1={460} y1={924} x2={460} y2={955} color={COLORS.cyan} />
+      <Arrow x1={460} y1={981} x2={460} y2={995} color={COLORS.cyan} />
+      <Arrow x1={460} y1={1023} x2={460} y2={1035} color={COLORS.cyan} />
+
+      {/* Bypass path */}
+      <rect x={80} y={955} width={200} height={55} rx={4} fill="rgba(64,208,224,0.07)" stroke={COLORS.cyan} strokeWidth={0.7} strokeDasharray="3,2" />
+      <text x={180} y={970} textAnchor="middle" fill={COLORS.cyan} fontFamily={fontMono} fontSize={8.5} fontWeight={600}>BYPASS: dev_direct_xmit()</text>
+      <text x={180} y={985} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>AF_XDP — skips qdisc entirely</text>
+      <text x={180} y={998} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>Writes directly to TX ring</text>
+      <Arrow x1={180} y1={1010} x2={340} y2={1048} color={COLORS.cyan} dashed />
+
+      {/* NIC */}
+      <LayerBand x={30} y={1100} w={W - 60} h={70} label="NIC HARDWARE" color={COLORS.yellow} dimColor={COLORS.yellowDim} />
+      <Arrow x1={460} y1={1061} x2={460} y2={1115} color={COLORS.yellow} />
+
+      <FuncBox x={300} y={1115} w={320} h={36} label="TX Ring → DMA → Wire" sublabel="MMIO doorbell write triggers NIC transmit" color={COLORS.yellow} dimColor={COLORS.bg} />
+
+      {/* Wire */}
+      <line x1={200} y1={1175} x2={720} y2={1175} stroke={COLORS.yellow} strokeWidth={2} filter="url(#glow)" />
+      <Arrow x1={460} y1={1151} x2={460} y2={1175} color={COLORS.yellow} />
+      <text x={460} y={1192} textAnchor="middle" fill={COLORS.yellow} fontFamily={fontSans} fontSize={11} fontWeight={600}>WIRE</text>
+
+      {/* sk_buff annotation */}
+      <rect x={60} y={1210} width={800} height={65} rx={5} fill={COLORS.surfaceLight} stroke={COLORS.border} strokeWidth={0.8} />
+      <text x={80} y={1230} fill={COLORS.textBright} fontFamily={fontSans} fontSize={10} fontWeight={600}>sk_buff pointer progression (egress):</text>
+      <text x={80} y={1248} fill={COLORS.textDim} fontFamily={fontMono} fontSize={9}>transport_header ← set by TCP/UDP when building transport header</text>
+      <text x={80} y={1262} fill={COLORS.textDim} fontFamily={fontMono} fontSize={9}>network_header  ← set by IP layer when building IP header</text>
+      <text x={80} y={1248} fill={COLORS.textDim} fontFamily={fontMono} fontSize={9} dx={500}>mac_header ← set by dev_queue_xmit()</text>
+    </svg>
+  );
+}
+
+function IngressDiagram() {
+  const W = 920;
+  const H = 1500;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
+      <defs>
+        <filter id="glow2">
+          <feGaussianBlur stdDeviation="3" result="blur" />
+          <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+        </filter>
+      </defs>
+
+      <rect width={W} height={H} fill={COLORS.bg} rx={8} />
+
+      <text x={W / 2} y={35} textAnchor="middle" fill={COLORS.textBright} fontFamily={fontSans} fontSize={18} fontWeight={700} letterSpacing="0.5">
+        INGRESS PATH — RX
+      </text>
+      <text x={W / 2} y={52} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={11}>
+        Wire → Userspace Application
+      </text>
+
+      {/* Wire */}
+      <line x1={200} y1={75} x2={720} y2={75} stroke={COLORS.yellow} strokeWidth={2} filter="url(#glow2)" />
+      <text x={460} y={70} textAnchor="middle" fill={COLORS.yellow} fontFamily={fontSans} fontSize={11} fontWeight={600}>WIRE</text>
+
+      {/* NIC */}
+      <LayerBand x={30} y={90} w={W - 60} h={110} label="NIC HARDWARE" color={COLORS.yellow} dimColor={COLORS.yellowDim} />
+      <Arrow x1={460} y1={78} x2={460} y2={110} color={COLORS.yellow} />
+      <FuncBox x={300} y={110} w={320} h={30} label="NIC receives frame" color={COLORS.yellow} dimColor={COLORS.bg} />
+      <text x={660} y={120} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>MAC filter, FCS check</text>
+      <text x={660} y={132} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>HW checksum offload, RSS hash</text>
+
+      <FuncBox x={300} y={150} w={320} h={30} label="DMA → RX Ring descriptor" color={COLORS.yellow} dimColor={COLORS.bg} fontSize={10} />
+      <text x={660} y={168} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Write pkt to pre-alloc'd ring buffer</text>
+      <Arrow x1={460} y1={140} x2={460} y2={150} color={COLORS.yellow} />
+      <Arrow x1={460} y1={180} x2={460} y2={210} color={COLORS.yellow} label="MSI-X IRQ" />
+
+      {/* DRIVER / NAPI */}
+      <LayerBand x={30} y={210} w={W - 60} h={180} label="DRIVER / NAPI" color={COLORS.cyan} dimColor={COLORS.cyanDim} />
+
+      <FuncBox x={300} y={232} w={320} h={30} label="IRQ handler → napi_schedule()" color={COLORS.cyan} dimColor={COLORS.bg} fontSize={10} />
+      <text x={660} y={245} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Schedule NAPI poll, mask IRQ</text>
+      <text x={660} y={257} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Coalescing prevents per-pkt interrupts</text>
+
+      <FuncBox x={300} y={275} w={320} h={30} label="NET_RX_SOFTIRQ → napi_poll()" color={COLORS.cyan} dimColor={COLORS.bg} fontSize={10} />
+      <text x={660} y={290} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Driver poll fn walks RX ring</text>
+
+      <FuncBox x={300} y={316} w={320} h={26} label="Alloc sk_buff / page-pool pages" color={COLORS.cyan} dimColor={COLORS.bg} fontSize={10} />
+      <text x={660} y={332} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>eth_type_trans() → skb→protocol</text>
+
+      <FuncBox x={300} y={352} w={320} h={26} label="napi_gro_receive()" color={COLORS.cyan} dimColor={COLORS.bg} />
+      <text x={660} y={362} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>GRO: coalesce TCP segments</text>
+      <text x={660} y={374} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>into single large skb</text>
+
+      <Arrow x1={460} y1={262} x2={460} y2={275} color={COLORS.cyan} />
+      <Arrow x1={460} y1={305} x2={460} y2={316} color={COLORS.cyan} />
+      <Arrow x1={460} y1={342} x2={460} y2={352} color={COLORS.cyan} />
+
+      {/* XDP bypass */}
+      <rect x={60} y={245} width={200} height={60} rx={4} fill="rgba(64,208,224,0.07)" stroke={COLORS.cyan} strokeWidth={0.7} strokeDasharray="3,2" />
+      <text x={160} y={260} textAnchor="middle" fill={COLORS.cyan} fontFamily={fontMono} fontSize={8.5} fontWeight={600}>XDP HOOK (pre-skb alloc)</text>
+      <text x={160} y={275} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>XDP_DROP / XDP_TX / XDP_REDIRECT</text>
+      <text x={160} y={288} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>BPF_PROG_TYPE_XDP</text>
+      <text x={160} y={300} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>Runs on xdp_buff, before sk_buff</text>
+
+      {/* ETHERNET / CORE */}
+      <LayerBand x={30} y={400} w={W - 60} h={210} label="ETHERNET / CORE NETWORK" color={COLORS.green} dimColor={COLORS.greenDim} />
+      <Arrow x1={460} y1={378} x2={460} y2={422} color={COLORS.green} />
+
+      <FuncBox x={300} y={422} w={320} h={26} label="netif_receive_skb()" color={COLORS.green} dimColor={COLORS.bg} />
+      <text x={660} y={435} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Set skb→mac_header, pull ETH hdr</text>
+
+      <HookMarker x={210} y={462} label="ptype_all delivery → af_packet (tcpdump/libpcap)" color={COLORS.red} />
+
+      <HookMarker x={210} y={482} label="tc_ingress() — TC-BPF / clsact qdisc" color={COLORS.red} />
+
+      <text x={210} y={505} fill={COLORS.textDim} fontFamily={fontSans} fontSize={9}>Processing stages:</text>
+      <text x={220} y={518} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• VLAN: dispatch to VLAN sub-interface</text>
+      <text x={220} y={531} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Bridge: rx_handler() steals pkt if enslaved</text>
+      <text x={220} y={544} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• macvtap/bonding: registered rx_handler</text>
+
+      <FuncBox x={340} y={560} w={240} h={26} label="Protocol demux → ip_rcv()" color={COLORS.green} dimColor={COLORS.bg} fontSize={10} />
+      <text x={620} y={575} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Based on skb→protocol (ETH_P_IP)</text>
+      <Arrow x1={460} y1={448} x2={460} y2={560} color={COLORS.green} />
+
+      {/* IP LAYER */}
+      <LayerBand x={30} y={620} w={W - 60} h={310} label="IP LAYER (IPv4)" color={COLORS.purple} dimColor={COLORS.purpleDim} />
+      <Arrow x1={460} y1={586} x2={460} y2={645} color={COLORS.purple} />
+
+      <FuncBox x={340} y={645} w={240} h={26} label="ip_rcv()" color={COLORS.purple} dimColor={COLORS.bg} />
+      <text x={620} y={655} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Validate: ver==4, IHL≥5, totlen, csum</text>
+      <text x={620} y={668} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Set skb→transport_header</text>
+
+      <HookMarker x={190} y={688} label="NF_INET_PRE_ROUTING  (DNAT, conntrack)" color={COLORS.red} />
+
+      <FuncBox x={340} y={705} w={240} h={26} label="ip_rcv_finish() → FIB lookup" color={COLORS.purple} dimColor={COLORS.bg} fontSize={10} />
+      <text x={620} y={720} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>ip_route_input_noref() → sets dst→input</text>
+
+      <Arrow x1={460} y1={671} x2={460} y2={705} color={COLORS.purple} />
+
+      {/* Routing decision */}
+      <rect x={200} y={745} width={520} height={75} rx={5} fill="rgba(176,125,240,0.08)" stroke={COLORS.purple} strokeWidth={0.7} />
+      <text x={460} y={762} textAnchor="middle" fill={COLORS.purple} fontFamily={fontSans} fontSize={10} fontWeight={700}>ROUTING DECISION (dst_input)</text>
+      <FuncBox x={210} y={773} w={150} h={24} label="ip_local_deliver()" sublabel="" color={COLORS.green} dimColor={COLORS.bg} fontSize={9} />
+      <text x={285} y={806} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>For us (local)</text>
+      <FuncBox x={385} y={773} w={140} h={24} label="ip_forward()" color={COLORS.orange} dimColor={COLORS.bg} fontSize={9} />
+      <text x={455} y={806} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>Not for us (fwd)</text>
+      <FuncBox x={555} y={773} w={150} h={24} label="ip_mr_input()" color={COLORS.cyan} dimColor={COLORS.bg} fontSize={9} />
+      <text x={630} y={806} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>Multicast</text>
+      <Arrow x1={460} y1={731} x2={460} y2={745} color={COLORS.purple} />
+
+      {/* Continue local delivery */}
+      <Arrow x1={350} y1={798} x2={350} y2={845} color={COLORS.green} />
+
+      <FuncBox x={300} y={845} w={320} h={26} label="ip_defrag() → reassemble fragments" color={COLORS.purple} dimColor={COLORS.bg} fontSize={10} />
+      <HookMarker x={190} y={885} label="NF_INET_LOCAL_IN  (iptables INPUT chain)" color={COLORS.red} />
+      <FuncBox x={300} y={900} w={320} h={26} label="ip_local_deliver_finish() → strip IP hdr" color={COLORS.purple} dimColor={COLORS.bg} fontSize={10} />
+      <Arrow x1={460} y1={871} x2={460} y2={900} color={COLORS.purple} />
+      <text x={660} y={915} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>Dispatch to transport via protocol field</text>
+
+      {/* Branch to TCP / UDP */}
+      <Arrow x1={400} y1={926} x2={260} y2={955} color={COLORS.purple} />
+      <Arrow x1={520} y1={926} x2={660} y2={955} color={COLORS.purple} />
+
+      {/* TRANSPORT LAYER */}
+      <LayerBand x={30} y={930} w={W - 60} h={335} label="TRANSPORT LAYER" color={COLORS.orange} dimColor={COLORS.orangeDim} />
+
+      {/* TCP Column */}
+      <rect x={60} y={958} width={370} height={295} rx={5} fill="rgba(240,160,80,0.05)" stroke={COLORS.orange} strokeWidth={0.5} strokeDasharray="3,3" />
+      <text x={245} y={978} textAnchor="middle" fill={COLORS.orange} fontFamily={fontSans} fontSize={12} fontWeight={700}>TCP</text>
+
+      <FuncBox x={110} y={988} w={270} h={26} label="tcp_v4_rcv()" color={COLORS.orange} dimColor={COLORS.bg} />
+      <text x={110} y={1026} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Validate TCP hdr, pull, verify checksum</text>
+      <text x={110} y={1038} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• __inet_lookup_skb() — socket lookup</text>
+      <text x={110} y={1050} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>  (established hash → listener table)</text>
+
+      <FuncBox x={110} y={1058} w={270} h={26} label="tcp_v4_do_rcv()" color={COLORS.orange} dimColor={COLORS.bg} />
+
+      <rect x={120} y={1095} width={120} height={50} rx={4} fill="rgba(67,217,162,0.1)" stroke={COLORS.green} strokeWidth={1} />
+      <text x={180} y={1112} textAnchor="middle" fill={COLORS.green} fontFamily={fontMono} fontSize={9} fontWeight={700}>FAST PATH</text>
+      <text x={180} y={1126} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={7.5}>Header prediction OK</text>
+      <text x={180} y={1137} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={7.5}>Direct copy to userspace</text>
+
+      <rect x={252} y={1095} width={120} height={50} rx={4} fill="rgba(240,88,104,0.1)" stroke={COLORS.red} strokeWidth={1} />
+      <text x={312} y={1112} textAnchor="middle" fill={COLORS.red} fontFamily={fontMono} fontSize={9} fontWeight={700}>SLOW PATH</text>
+      <text x={312} y={1126} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={7.5}>OOO, SACK, ECN, SYN</text>
+      <text x={312} y={1137} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={7.5}>Full state machine</text>
+
+      <FuncBox x={110} y={1158} w={270} h={26} label="tcp_rcv_established()" color={COLORS.orange} dimColor={COLORS.bg} />
+      <text x={110} y={1195} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Enqueue to sk→sk_receive_queue</text>
+      <text x={110} y={1207} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• sk→sk_data_ready() wakes reader</text>
+
+      <FuncBox x={110} y={1215} w={270} h={26} label="SYN: tcp_check_req() / SYN cookies" color={COLORS.orange} dimColor={COLORS.bg} fontSize={9} />
+
+      {/* UDP Column */}
+      <rect x={490} y={958} width={370} height={295} rx={5} fill="rgba(240,160,80,0.05)" stroke={COLORS.orange} strokeWidth={0.5} strokeDasharray="3,3" />
+      <text x={675} y={978} textAnchor="middle" fill={COLORS.orange} fontFamily={fontSans} fontSize={12} fontWeight={700}>UDP</text>
+
+      <FuncBox x={540} y={988} w={270} h={26} label="udp_rcv() → __udp4_lib_rcv()" color={COLORS.orange} dimColor={COLORS.bg} fontSize={10} />
+      <text x={540} y={1026} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Socket lookup by dst port</text>
+      <text x={540} y={1038} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Verify checksum</text>
+
+      <FuncBox x={540} y={1050} w={270} h={26} label="udp_queue_rcv_skb()" color={COLORS.orange} dimColor={COLORS.bg} />
+      <text x={540} y={1088} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Enqueue to sk→sk_receive_queue</text>
+      <text x={540} y={1100} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• sk→sk_data_ready() wakes reader</text>
+
+      <FuncBox x={540} y={1115} w={270} h={26} label="skb_consume_udp()" color={COLORS.orange} dimColor={COLORS.bg} />
+      <text x={540} y={1153} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Adjust peek offset</text>
+      <text x={540} y={1165} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>• Free sk_buff</text>
+
+      {/* Merge arrows to socket */}
+      <Arrow x1={460} y1={1265} x2={460} y2={1284} color={COLORS.orange} />
+
+      {/* SOCKET LAYER */}
+      <LayerBand x={30} y={1285} w={W - 60} h={80} label="SOCKET LAYER" color={COLORS.accent} dimColor={COLORS.accentGlow} />
+      <FuncBox x={260} y={1305} w={400} h={28} label="read() → sock_recvmsg() → inet_recvmsg()" color={COLORS.accent} dimColor={COLORS.bg} fontSize={10} />
+      <HookMarker x={370} y={1347} label="LSM hook" color={COLORS.red} />
+      <text x={520} y={1347} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>→ tcp_recvmsg() / udp_recvmsg() → copy to user buffer</text>
+
+      {/* USERSPACE */}
+      <LayerBand x={30} y={1385} w={W - 60} h={60} label="USERSPACE" color={COLORS.green} dimColor={COLORS.greenDim} />
+      <Arrow x1={460} y1={1334} x2={460} y2={1410} color={COLORS.green} />
+      <FuncBox x={340} y={1410} w={240} h={26} label="Application reads data" color={COLORS.green} dimColor={COLORS.bg} />
+
+      {/* sk_buff annotation */}
+      <rect x={60} y={1455} width={800} height={35} rx={5} fill={COLORS.surfaceLight} stroke={COLORS.border} strokeWidth={0.8} />
+      <text x={80} y={1472} fill={COLORS.textBright} fontFamily={fontSans} fontSize={10} fontWeight={600}>sk_buff pointer progression (ingress) :</text>
+      <text x={270} y={1472} fill={COLORS.textDim} fontFamily={fontMono} fontSize={9}>mac_header → network_header → transport_header → data (headers stripped at each layer)</text>
+    </svg>
+  );
+}
+
+function SkbuffDiagram() {
+  const W = 920;
+  const H = 420;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
+      <rect width={W} height={H} fill={COLORS.bg} rx={8} />
+      <text x={W / 2} y={30} textAnchor="middle" fill={COLORS.textBright} fontFamily={fontSans} fontSize={16} fontWeight={700}>
+        sk_buff Structure & Packet Buffer Layout
+      </text>
+
+      {/* Packet buffer */}
+      <rect x={80} y={80} width={760} height={70} rx={4} fill={COLORS.surfaceLight} stroke={COLORS.border} strokeWidth={1.5} />
+
+      {/* Sections */}
+      <rect x={80} y={80} width={60} height={70} fill="rgba(107,125,147,0.2)" stroke={COLORS.textDim} strokeWidth={0.5} />
+      <text x={110} y={120} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontMono} fontSize={9}>head</text>
+      <text x={110} y={133} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontMono} fontSize={7}>room</text>
+
+      <rect x={140} y={80} width={130} height={70} fill={COLORS.greenDim} stroke={COLORS.green} strokeWidth={1} />
+      <text x={205} y={115} textAnchor="middle" fill={COLORS.green} fontFamily={fontMono} fontSize={11} fontWeight={600}>Ethernet</text>
+      <text x={205} y={130} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>14B (no VLAN)</text>
+
+      <rect x={270} y={80} width={130} height={70} fill={COLORS.purpleDim} stroke={COLORS.purple} strokeWidth={1} />
+      <text x={335} y={115} textAnchor="middle" fill={COLORS.purple} fontFamily={fontMono} fontSize={11} fontWeight={600}>IP</text>
+      <text x={335} y={130} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>20-60B</text>
+
+      <rect x={400} y={80} width={130} height={70} fill={COLORS.orangeDim} stroke={COLORS.orange} strokeWidth={1} />
+      <text x={465} y={115} textAnchor="middle" fill={COLORS.orange} fontFamily={fontMono} fontSize={11} fontWeight={600}>TCP/UDP</text>
+      <text x={465} y={130} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>20-60B / 8B</text>
+
+      <rect x={530} y={80} width={240} height={70} fill={COLORS.accentGlow} stroke={COLORS.accent} strokeWidth={1} />
+      <text x={650} y={115} textAnchor="middle" fill={COLORS.accent} fontFamily={fontMono} fontSize={11} fontWeight={600}>Payload (linear data)</text>
+
+      <rect x={770} y={80} width={70} height={70} fill="rgba(107,125,147,0.2)" stroke={COLORS.textDim} strokeWidth={0.5} />
+      <text x={805} y={120} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontMono} fontSize={9}>tail</text>
+      <text x={805} y={133} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontMono} fontSize={7}>room</text>
+
+      {/* Pointers */}
+      <line x1={80} y1={170} x2={80} y2={185} stroke={COLORS.textDim} strokeWidth={1.5} />
+      <text x={80} y={198} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontMono} fontSize={9} fontWeight={600}>head</text>
+
+      <line x1={140} y1={170} x2={140} y2={195} stroke={COLORS.green} strokeWidth={1.5} />
+      <text x={140} y={210} textAnchor="middle" fill={COLORS.green} fontFamily={fontMono} fontSize={9} fontWeight={600}>mac_header</text>
+
+      <line x1={270} y1={170} x2={270} y2={215} stroke={COLORS.purple} strokeWidth={1.5} />
+      <text x={270} y={228} textAnchor="middle" fill={COLORS.purple} fontFamily={fontMono} fontSize={9} fontWeight={600}>network_header</text>
+
+      <line x1={400} y1={170} x2={400} y2={195} stroke={COLORS.orange} strokeWidth={1.5} />
+      <text x={400} y={210} textAnchor="middle" fill={COLORS.orange} fontFamily={fontMono} fontSize={9} fontWeight={600}>transport_header</text>
+
+      <line x1={530} y1={170} x2={530} y2={215} stroke={COLORS.accent} strokeWidth={1.5} />
+      <text x={530} y={228} textAnchor="middle" fill={COLORS.accent} fontFamily={fontMono} fontSize={9} fontWeight={600}>data</text>
+
+      <line x1={770} y1={170} x2={770} y2={195} stroke={COLORS.textDim} strokeWidth={1.5} />
+      <text x={770} y={210} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontMono} fontSize={9} fontWeight={600}>tail</text>
+
+      <line x1={840} y1={170} x2={840} y2={185} stroke={COLORS.textDim} strokeWidth={1.5} />
+      <text x={840} y={198} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontMono} fontSize={9} fontWeight={600}>end</text>
+
+      {/* skb_shared_info / frags */}
+      <text x={W / 2} y={268} textAnchor="middle" fill={COLORS.textBright} fontFamily={fontSans} fontSize={12} fontWeight={600}>
+        Non-linear data (skb_shared_info→frags[])
+      </text>
+
+      <rect x={120} y={285} width={680} height={50} rx={4} fill={COLORS.surfaceLight} stroke={COLORS.border} strokeWidth={1} />
+      <text x={130} y={298} fill={COLORS.textDim} fontFamily={fontMono} fontSize={8}>skb_shared_info</text>
+
+      {["frag[0]", "frag[1]", "frag[2]", "frag[3]", "..."].map((label, i) => (
+        <g key={i}>
+          <rect x={140 + i * 125} y={305} width={110} height={22} rx={3} fill={COLORS.accentGlow} stroke={COLORS.accent} strokeWidth={0.7} />
+          <text x={195 + i * 125} y={319} textAnchor="middle" fill={COLORS.accent} fontFamily={fontMono} fontSize={9}>{label}</text>
+        </g>
+      ))}
+      <text x={460} y={360} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={9}>
+        Each frag is a (page, offset, len) tuple — enables scatter-gather I/O, GRO, zero-copy
+      </text>
+
+      {/* Legend for ingress data pointer movement */}
+      <rect x={120} y={380} width={680} height={28} rx={4} fill="rgba(240,88,104,0.08)" stroke={COLORS.red} strokeWidth={0.6} />
+      <text x={460} y={398} textAnchor="middle" fill={COLORS.red} fontFamily={fontSans} fontSize={9}>
+        Ingress: each layer advances skb→data past its header (skb_pull). Egress: each layer pushes header before skb→data (skb_push).
+      </text>
+    </svg>
+  );
+}
+
+function NetfilterDiagram() {
+  const W = 920;
+  const H = 350;
+  const hookColor = COLORS.red;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto" }}>
+      <rect width={W} height={H} fill={COLORS.bg} rx={8} />
+      <text x={W / 2} y={30} textAnchor="middle" fill={COLORS.textBright} fontFamily={fontSans} fontSize={16} fontWeight={700}>
+        Netfilter Hook Points (iptables / nftables)
+      </text>
+
+      {/* Central routing decision */}
+      <rect x={370} y={130} width={180} height={45} rx={22} fill={COLORS.purpleDim} stroke={COLORS.purple} strokeWidth={1.5} />
+      <text x={460} y={157} textAnchor="middle" fill={COLORS.purple} fontFamily={fontSans} fontSize={12} fontWeight={700}>ROUTING DECISION</text>
+
+      {/* PRE_ROUTING */}
+      <FuncBox x={60} y={140} w={170} h={30} label="NF_INET_PRE_ROUTING" color={hookColor} dimColor={COLORS.redDim} fontSize={9} />
+      <text x={155} y={185} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>DNAT, conntrack</text>
+      <Arrow x1={230} y1={155} x2={370} y2={155} color={hookColor} />
+
+      {/* INPUT */}
+      <FuncBox x={375} y={210} w={170} h={30} label="NF_INET_LOCAL_IN" color={hookColor} dimColor={COLORS.redDim} fontSize={9} />
+      <text x={650} y={245} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>INPUT chain (filter)</text>
+      <Arrow x1={460} y1={175} x2={460} y2={210} color={hookColor} />
+
+      {/* Local process */}
+      <FuncBox x={375} y={275} w={170} h={30} label="Local Process" color={COLORS.green} dimColor={COLORS.greenDim} fontSize={10} />
+      <Arrow x1={460} y1={240} x2={460} y2={275} color={COLORS.green} />
+
+      {/* FORWARD */}
+      <FuncBox x={690} y={140} w={170} h={30} label="NF_INET_FORWARD" color={hookColor} dimColor={COLORS.redDim} fontSize={9} />
+      <text x={775} y={185} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>FORWARD chain</text>
+      <Arrow x1={550} y1={155} x2={690} y2={155} color={hookColor} />
+
+      {/* OUTPUT */}
+      <FuncBox x={120} y={275} w={170} h={30} label="NF_INET_LOCAL_OUT" color={hookColor} dimColor={COLORS.redDim} fontSize={9} />
+      <text x={205} y={245} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>OUTPUT chain, conntrack</text>
+      <Arrow x1={375} y1={290} x2={290} y2={290} color={hookColor} />
+
+      {/* POST_ROUTING — combine output + forward */}
+      <FuncBox x={620} y={275} w={180} h={30} label="NF_INET_POST_ROUTING" color={hookColor} dimColor={COLORS.redDim} fontSize={9} />
+      <text x={710} y={320} textAnchor="middle" fill={COLORS.textDim} fontFamily={fontSans} fontSize={8}>SNAT, masquerade</text>
+      <Arrow x1={730} y1={170} x2={730} y2={275} color={hookColor} />
+      <Arrow x1={200} y1={273} x2={200} y2={250} color={COLORS.textDim} dashed />
+      <line x1={200} y1={250} x2={660} y2={250} stroke={COLORS.textDim} strokeWidth={1} strokeDasharray="4,3" />
+      <Arrow x1={660} y1={250} x2={660} y2={275} color={COLORS.textDim} dashed />
+
+      {/* Wire labels */}
+      <text x={65} y={185} fill={COLORS.yellow} fontFamily={fontSans} fontSize={10} fontWeight={600}>← from wire</text>
+      <text x={750} y={320} fill={COLORS.yellow} fontFamily={fontSans} fontSize={10} fontWeight={600}>→ to wire</text>
+
+      {/* eBPF annotations */}
+      <rect x={60} y={55} width={800} height={55} rx={5} fill={COLORS.surfaceLight} stroke={COLORS.border} strokeWidth={0.7} />
+      <text x={80} y={72} fill={COLORS.cyan} fontFamily={fontSans} fontSize={10} fontWeight={600}>eBPF Hook Points (parallel to netfilter):</text>
+      <text x={80} y={88} fill={COLORS.textDim} fontFamily={fontMono} fontSize={8.5}>XDP (driver, pre-skb) → TC ingress (clsact) → cgroup/sock_ops → TC egress (clsact) → XDP_TX (driver)</text>
+      <text x={80} y={102} fill={COLORS.textDim} fontFamily={fontSans} fontSize={8.5}>eBPF can bypass netfilter entirely for high-perf paths. XDP runs before sk_buff allocation — lowest possible latency.</text>
+    </svg>
+  );
+}
+
+function ZoomableContainer({ children, tab }) {
+  const [scale, setScale] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+  const containerRef = useRef(null);
+
+  // Reset zoom/pan when tab changes
+  useEffect(() => {
+    setScale(1);
+    setPan({ x: 0, y: 0 });
+  }, [tab]);
+
+  const ZOOM_STEP = 0.15;
+  const MIN_ZOOM = 0.3;
+  const MAX_ZOOM = 4;
+
+  const zoomIn = useCallback(() => {
+    setScale((s) => Math.min(MAX_ZOOM, s + ZOOM_STEP));
+  }, []);
+
+  const zoomOut = useCallback(() => {
+    setScale((s) => Math.max(MIN_ZOOM, s - ZOOM_STEP));
+  }, []);
+
+  const resetView = useCallback(() => {
+    setScale(1);
+    setPan({ x: 0, y: 0 });
+  }, []);
+
+  const handleWheel = useCallback((e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? -ZOOM_STEP : ZOOM_STEP;
+    setScale((s) => Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, s + delta)));
+  }, []);
+
+  const handleMouseDown = useCallback((e) => {
+    if (e.button !== 0) return;
+    setIsPanning(true);
+    setPanStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
+  }, [pan]);
+
+  const handleMouseMove = useCallback((e) => {
+    if (!isPanning) return;
+    setPan({ x: e.clientX - panStart.x, y: e.clientY - panStart.y });
+  }, [isPanning, panStart]);
+
+  const handleMouseUp = useCallback(() => {
+    setIsPanning(false);
+  }, []);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleWheel);
+  }, [handleWheel]);
+
+  const zoomPct = Math.round(scale * 100);
+
+  const btnStyle = (active) => ({
+    width: 36, height: 36,
+    border: `1px solid ${COLORS.border}`,
+    borderRadius: 6,
+    background: active ? COLORS.surfaceLight : COLORS.surface,
+    color: COLORS.textBright,
+    fontFamily: fontMono,
+    fontSize: 16,
+    fontWeight: 700,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    transition: "all 0.15s",
+    lineHeight: 1,
+  });
+
+  return (
+    <div style={{ position: "relative" }}>
+      {/* Zoom toolbar */}
+      <div style={{
+        position: "sticky", top: 0, zIndex: 10,
+        display: "flex", alignItems: "center", gap: 6,
+        padding: "8px 12px",
+        background: `${COLORS.surface}ee`,
+        backdropFilter: "blur(8px)",
+        borderBottom: `1px solid ${COLORS.border}`,
+        borderRadius: "8px 8px 0 0",
+      }}>
+        <button onClick={zoomOut} style={btnStyle()} title="Zoom out (or scroll down)">−</button>
+        <div style={{
+          minWidth: 52, textAlign: "center",
+          color: COLORS.textDim, fontFamily: fontMono, fontSize: 11,
+          userSelect: "none",
+        }}>
+          {zoomPct}%
+        </div>
+        <button onClick={zoomIn} style={btnStyle()} title="Zoom in (or scroll up)">+</button>
+        <button onClick={resetView} style={{ ...btnStyle(), width: "auto", padding: "0 10px", fontSize: 11 }} title="Reset zoom and pan">
+          Reset
+        </button>
+        <div style={{ flex: 1 }} />
+        <span style={{ color: COLORS.textDim, fontFamily: fontSans, fontSize: 10, opacity: 0.7, userSelect: "none" }}>
+          Scroll to zoom · Drag to pan
+        </span>
+      </div>
+
+      {/* Zoomable viewport */}
+      <div
+        ref={containerRef}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        style={{
+          overflow: "hidden",
+          cursor: isPanning ? "grabbing" : "grab",
+          borderRadius: "0 0 8px 8px",
+          border: `1px solid ${COLORS.border}`,
+          borderTop: "none",
+          maxHeight: isInIframe ? "75vh" : "calc(100vh - 160px)",
+          background: COLORS.bg,
+        }}
+      >
+        <div style={{
+          transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`,
+          transformOrigin: "top center",
+          transition: isPanning ? "none" : "transform 0.15s ease-out",
+          willChange: "transform",
+        }}>
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LinuxPacketPath() {
+  const [tab, setTab] = useState("egress");
+
+  const tabs = [
+    { id: "egress", label: "Egress (TX)" },
+    { id: "ingress", label: "Ingress (RX)" },
+    { id: "skbuff", label: "sk_buff Layout" },
+    { id: "netfilter", label: "Netfilter / eBPF" },
+  ];
+
+  return (
+    <div style={{ background: COLORS.bg, minHeight: "100vh", padding: "16px", fontFamily: fontSans }}>
+      <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet" />
+
+      <div style={{ maxWidth: isInIframe ? 960 : 1400, margin: "0 auto" }}>
+        <h1 style={{ color: COLORS.textBright, fontSize: 22, fontWeight: 700, textAlign: "center", margin: "8px 0 4px", letterSpacing: "0.5px" }}>
+          The Path of a Packet Through the Linux Kernel
+        </h1>
+        <p style={{ color: COLORS.textDim, fontSize: 12, textAlign: "center", margin: "0 0 16px" }}>
+          TCP/IP & UDP/IP — kernel 5.10+ function-level trace
+        </p>
+
+        {/* Tab bar */}
+        <div style={{ display: "flex", gap: 4, marginBottom: 16, background: COLORS.surface, borderRadius: 8, padding: 4, border: `1px solid ${COLORS.border}` }}>
+          {tabs.map((t) => (
+            <button
+              key={t.id}
+              onClick={() => setTab(t.id)}
+              style={{
+                flex: 1,
+                padding: "10px 0",
+                border: "none",
+                borderRadius: 6,
+                background: tab === t.id ? COLORS.accent : "transparent",
+                color: tab === t.id ? "#fff" : COLORS.textDim,
+                fontFamily: fontSans,
+                fontSize: 13,
+                fontWeight: tab === t.id ? 700 : 500,
+                cursor: "pointer",
+                transition: "all 0.2s",
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Content with zoom/pan */}
+        <ZoomableContainer tab={tab}>
+          {tab === "egress" && <EgressDiagram />}
+          {tab === "ingress" && <IngressDiagram />}
+          {tab === "skbuff" && <SkbuffDiagram />}
+          {tab === "netfilter" && <NetfilterDiagram />}
+        </ZoomableContainer>
+
+        {/* Legend */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 16, marginTop: 12, padding: "10px 14px", background: COLORS.surface, borderRadius: 6, border: `1px solid ${COLORS.border}` }}>
+          {[
+            { color: COLORS.green, label: "Userspace / Ethernet" },
+            { color: COLORS.accent, label: "Socket Layer" },
+            { color: COLORS.orange, label: "Transport (TCP/UDP)" },
+            { color: COLORS.purple, label: "IP Layer" },
+            { color: COLORS.cyan, label: "Device / Driver / NAPI" },
+            { color: COLORS.yellow, label: "NIC Hardware" },
+            { color: COLORS.red, label: "Hook Point (netfilter/LSM/eBPF)" },
+          ].map((item) => (
+            <div key={item.label} style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div style={{ width: 10, height: 10, borderRadius: 2, background: item.color }} />
+              <span style={{ color: COLORS.textDim, fontSize: 10, fontFamily: fontSans }}>{item.label}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<LinuxPacketPath />);
+</script>
+</body>
+</html>
